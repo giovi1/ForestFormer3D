@@ -3,6 +3,8 @@ import argparse
 import os
 import os.path as osp
 
+import torch
+
 from mmengine.config import Config, ConfigDict, DictAction
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner

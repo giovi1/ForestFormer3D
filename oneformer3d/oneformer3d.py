@@ -708,7 +708,7 @@ class ForAINetV2OneFormer3D(Base3DDetector):
             from tqdm import tqdm
             step_size = self.radius
             grid_size = 0.2
-            num_points = 640000
+            num_points = 400000
             pts_semantic_gt = batch_data_samples[0].eval_ann_info['pts_semantic_mask']
             pts_instance_gt = batch_data_samples[0].eval_ann_info['pts_instance_mask']
             original_points = batch_inputs_dict['points'][0]
@@ -2580,13 +2580,12 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             #    data_sample.pred_pts_seg = results_list[i]
             #    data_sample.pred_pts_seg['originids'] = originids
                 #data_sample.originids = originids
-            if last_results is not None and len(last_results)==len(batch_data_samples):                 # 本帧里至少有一个 region 得到了结果
-                for i, data_sample in enumerate(batch_data_samples):
-                    data_sample.pred_pts_seg = last_results[i]
-                    data_sample.pred_pts_seg['originids'] = last_originids
-            else:                                      
-                for data_sample in batch_data_samples:
-                    data_sample.pred_pts_seg = None
+            pred_seg = PointData(
+                pts_semantic_mask=[final_semantic_labels, final_semantic_labels],
+                pts_instance_mask=[clean_all_pre_ins, clean_all_pre_ins],
+            )
+            for data_sample in batch_data_samples:
+                data_sample.pred_pts_seg = pred_seg
             return batch_data_samples
         else:
             coordinates, features, inverse_mapping, spatial_shape = self.collate(
