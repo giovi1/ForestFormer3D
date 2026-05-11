@@ -2259,11 +2259,11 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
     
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
     #def predict_rm_outputpoints(self, batch_inputs_dict, batch_data_samples, **kwargs):
-        t0 = time.time()            
+        t0 = time.time()
         lidar_path = batch_data_samples[0].lidar_path
         base_name = os.path.basename(lidar_path)
         current_filename = os.path.splitext(base_name)[0]
-        t1 = time.time()                 
+        t1 = time.time()
         #########print(f"load pc: {(t1 - t0)*1000:.0f} ms")
         #is_test = True
         #if is_test:
@@ -2335,17 +2335,17 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                 wood_class = 1
                 semantic_predictions_bi = torch.argmax(bi_semantic_logits, dim=1)
                 tree_indices = torch.where(semantic_predictions_bi == wood_class)[0]  #all voxel
-                t5 = time.time()                 
-                #########print(f"u net heads: {(t5 - t4_4)*1000:.0f} ms")  
+                t5 = time.time()
+                #########print(f"u net heads: {(t5 - t4_4)*1000:.0f} ms")
                 with torch.no_grad():
-                    nn_idx_pc1 = []                
+                    nn_idx_pc1 = []
                     chunk = self.chunk
                     for ss in range(0, pc1.shape[0], chunk):
                         ee = min(ss + chunk, pc1.shape[0])
                         nn_idx_pc1.append(
                             torch.cdist(pc1[ss:ee].float(), pc3.float()).argmin(1)
                         )
-                    nn_idx_pc1 = torch.cat(nn_idx_pc1)   # (N_pc1,)  
+                    nn_idx_pc1 = torch.cat(nn_idx_pc1)   # (N_pc1,)
                 if tree_indices.numel() > 1:
                     
                     # FPS from all tree points
@@ -2580,6 +2580,16 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             #    data_sample.pred_pts_seg = results_list[i]
             #    data_sample.pred_pts_seg['originids'] = originids
                 #data_sample.originids = originids
+
+            # --- Blocco precedente ---
+            # if last_results is not None and len(last_results)==len(batch_data_samples):                 # 本帧里至少有一个 region 得到了结果
+            #     for i, data_sample in enumerate(batch_data_samples):
+            #         data_sample.pred_pts_seg = last_results[i]
+            #         data_sample.pred_pts_seg['originids'] = last_originids
+            # else:
+            #     for data_sample in batch_data_samples:
+            #         data_sample.pred_pts_seg = None
+            # --- ---
             pred_seg = PointData(
                 pts_semantic_mask=[final_semantic_labels, final_semantic_labels],
                 pts_instance_mask=[clean_all_pre_ins, clean_all_pre_ins],

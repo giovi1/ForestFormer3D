@@ -3,8 +3,6 @@ import argparse
 import os
 import os.path as osp
 
-import torch
-
 from mmengine.config import Config, ConfigDict, DictAction
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
@@ -121,29 +119,9 @@ def main():
         cfg.work_dir = osp.join('./work_dirs',
                                 osp.splitext(osp.basename(args.config))[0])
 
-    print('Applying spconv checkpoint fix in-memory...')
-    checkpoint = torch.load(args.checkpoint, map_location='cpu')
+    cfg.load_from = args.checkpoint
 
-    key_to_fix = 'state_dict'
-    if key_to_fix not in checkpoint:
-        raise KeyError(f"Could not find a state dictionary ('state_dict') in the checkpoint: {args.checkpoint}")
-
-    checkpoint_to_fix = checkpoint[key_to_fix]
-
-    for layer in list(checkpoint_to_fix.keys()):
-        if (layer.startswith('unet') or layer.startswith('input_conv')) \
-            and layer.endswith('weight') \
-            and len(checkpoint_to_fix[layer].shape) == 5:
-            checkpoint_to_fix[layer] = checkpoint_to_fix[layer].permute(1, 2, 3, 4, 0)
-    
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pth') as tmp_checkpoint_file:
-        torch.save(checkpoint, tmp_checkpoint_file.name)
-        cfg.load_from = tmp_checkpoint_file.name
-    print(f'Spconv checkpoint fix applied. Using temporary checkpoint: {cfg.load_from}')
-
-    # "Modify the output_path in the function 'predict'"
-    # Fix is toinject the work_dir into the model's test_cfg to avoid hardcoded paths for saving predictions.
+    # Inject work_dir into the model's test_cfg to avoid hardcoded paths for saving predictions.
     if cfg.model.get('test_cfg') is None:
         cfg.model.test_cfg = ConfigDict()
     cfg.model.test_cfg['output_dir'] = cfg.work_dir

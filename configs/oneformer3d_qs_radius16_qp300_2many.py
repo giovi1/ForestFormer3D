@@ -7,7 +7,7 @@ custom_imports = dict(imports=['oneformer3d'])
 num_channels = 32
 num_instance_classes = 3
 num_semantic_classes = 3
-radius = 8  # modify the radius of input cylinder (was 16)
+radius = 16  # modify the radius of input cylinder
 score_th = 00.4
 chunk = 2_500  # was 20_000
 model = dict(
@@ -24,7 +24,8 @@ model = dict(
     #prepare_epoch2=-1,#1000,
     query_point_num=300,   #modify the number of query points
     radius=radius,
-    score_th = score_th,
+    score_th=score_th,
+    chunk=chunk,
     backbone=dict(
         type='SpConvUNet',
         num_planes=[num_channels * (i + 1) for i in range(5)],
@@ -73,7 +74,8 @@ model = dict(
         matrix_nms_kernel='linear',
         num_sem_cls=num_semantic_classes,
         stuff_cls=[0],
-        thing_cls=[0]))
+        thing_cls=[0],
+        output_dir='work_dirs/oneformer3d_qs_radius16_qp300_2many_run2'))
 
 # dataset settings
 dataset_type = 'ForAINetV2SegDataset_'
