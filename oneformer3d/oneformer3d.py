@@ -2266,7 +2266,7 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         t1 = time.time()
         #########print(f"load pc: {(t1 - t0)*1000:.0f} ms")
         if not self.training:
-            step_size = self.radius/4
+            step_size = self.test_cfg.get('step_size', self.radius / 4)
             grid_size = 0.2
             num_points = 640000
             pts_semantic_gt = batch_data_samples[0].eval_ann_info['pts_semantic_mask']

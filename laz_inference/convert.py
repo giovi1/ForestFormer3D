@@ -8,6 +8,8 @@ Usage (from /workspace inside the container):
     python laz_inference/convert.py cloud1.laz cloud2.laz cloud3.laz
     python laz_inference/convert.py --input-dir /path/to/laz_dir/
     python laz_inference/convert.py cloud.laz --out-dir /custom/out --test-list /custom/list.txt
+    python laz_inference/convert.py cloud.laz --voxel-size 0.1   # subsample at 0.1m voxels
+    python laz_inference/convert.py cloud.laz --voxel-size 0     # disable subsampling
 """
 import argparse
 import sys
@@ -21,7 +23,14 @@ sys.path.insert(0, str(REPO_ROOT / "data" / "ForAINetV2"))
 from plyutils import write_ply  # noqa: E402
 
 
-def convert_one(laz_path: Path, out_dir: Path) -> str:
+def voxel_downsample(xyz: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Return sorted indices keeping one point per voxel (first encountered)."""
+    vox = np.floor(xyz / voxel_size).astype(np.int64)
+    _, first_idx = np.unique(vox, axis=0, return_index=True)
+    return np.sort(first_idx)
+
+
+def convert_one(laz_path: Path, out_dir: Path, voxel_size: float | None) -> str:
     try:
         import laspy
     except ImportError:
@@ -39,18 +48,37 @@ def convert_one(laz_path: Path, out_dir: Path) -> str:
     x = np.asarray(las.x, dtype=np.float32)
     y = np.asarray(las.y, dtype=np.float32)
     z = np.asarray(las.z, dtype=np.float32)
-    n = len(x)
+
+    # Ground-truth instance labels from treeID (0 = non-tree).
+    if hasattr(las, "treeID"):
+        tree_id = np.asarray(las.treeID, dtype=np.int32)
+    else:
+        tree_id = np.zeros(len(x), dtype=np.int32)
+        print("  WARNING: no treeID field — ground-truth labels unavailable")
+
+    # Semantic class encoding expected by load_forainetv2_data.py:
+    #   label_ids = semantic_seg - 1,  bg_sem = [0]
+    # → semantic_seg=2 → label_ids=1 → tree (counted in evaluation)
+    # → semantic_seg=1 → label_ids=0 → background (ignored)
+    semantic_seg = np.where(tree_id > 0,
+                            np.int32(2), np.int32(1)).astype(np.int32)
 
     xyz = np.column_stack([x, y, z])
-    # Dummy labels: semantic_seg=1 (tree class), treeID=0 (no ground-truth instance).
-    # These are only used to satisfy the pipeline's file format; the model
-    # predicts instance segmentation from raw XYZ coordinates during inference.
-    semantic_seg = np.ones(n, dtype=np.int32).reshape(-1, 1)
-    tree_id = np.zeros(n, dtype=np.int32).reshape(-1, 1)
+    n_orig = len(x)
 
-    write_ply(str(out_ply), [xyz, semantic_seg, tree_id],
+    if voxel_size is not None:
+        idx = voxel_downsample(xyz, voxel_size)
+        xyz        = xyz[idx]
+        semantic_seg = semantic_seg[idx]
+        tree_id    = tree_id[idx]
+        print(f"  Subsampled {n_orig:,} → {len(idx):,} pts  (voxel_size={voxel_size} m)")
+    else:
+        print(f"  {n_orig:,} points (no subsampling)")
+
+    write_ply(str(out_ply),
+              [xyz, semantic_seg.reshape(-1, 1), tree_id.reshape(-1, 1)],
               ["x", "y", "z", "semantic_seg", "treeID"])
-    print(f"  Saved {n:,} points.")
+    print(f"  Saved {len(xyz):,} points → {out_ply}")
     return scan_name
 
 
@@ -77,10 +105,20 @@ def main():
         "--test-list", metavar="FILE", default=default_list,
         help=f"Path to write scan-name list (default: {default_list})"
     )
+    parser.add_argument(
+        "--voxel-size", type=float, default=0.1, metavar="M",
+        help=(
+            "Voxel grid size in metres for subsampling (default: 0.1). "
+            "TLS plots are typically 50-100M pts; 0.1 m reduces to ~1-3M. "
+            "Use 0 to disable subsampling."
+        ),
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    voxel_size = args.voxel_size if args.voxel_size > 0 else None
 
     input_files: list[Path] = [Path(f) for f in args.files]
     if args.input_dir:
@@ -96,7 +134,7 @@ def main():
         if not f.exists():
             print(f"WARNING: {f} not found — skipping.")
             continue
-        scan_names.append(convert_one(f, out_dir))
+        scan_names.append(convert_one(f, out_dir, voxel_size))
 
     test_list_path = Path(args.test_list)
     test_list_path.parent.mkdir(parents=True, exist_ok=True)

@@ -14,6 +14,8 @@
 #                  (default: configs/oneformer3d_qs_radius16_qp300_2many.py)
 #   --model F      Path to the checkpoint file
 #                  (default: work_dirs/clean_forestformer/epoch_3000_fix.pth)
+#   --voxel-size M Voxel grid size in metres for subsampling (default: 0.1)
+#                  Use 0 to disable subsampling.
 
 set -euo pipefail
 
@@ -24,16 +26,18 @@ DATA_DIR="$WORK_DIR/data-test"
 TEST_LIST="$DATA_DIR/meta_data/test_list.txt"
 GPU=0
 FORCE=0
+VOXEL_SIZE=0.1
 CONVERT_ARGS=()
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --gpu)    GPU="$2";    shift 2 ;;
-        --config) CONFIG="$2"; shift 2 ;;
-        --model)  MODEL="$2";  shift 2 ;;
-        --force)  FORCE=1;     shift   ;;
-        *)        CONVERT_ARGS+=("$1"); shift ;;
+        --gpu)         GPU="$2";        shift 2 ;;
+        --config)      CONFIG="$2";     shift 2 ;;
+        --model)       MODEL="$2";      shift 2 ;;
+        --voxel-size)  VOXEL_SIZE="$2"; shift 2 ;;
+        --force)       FORCE=1;         shift   ;;
+        *)             CONVERT_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -48,8 +52,9 @@ cd "$WORK_DIR"
 # ── 1. Convert .laz → .ply and write test_list.txt ───────────────────────────
 echo "=== [1/4] Converting .laz files ==="
 python laz_inference/convert.py "${CONVERT_ARGS[@]}" \
-    --out-dir  "$DATA_DIR/test_data" \
-    --test-list "$TEST_LIST"
+    --out-dir    "$DATA_DIR/test_data" \
+    --test-list  "$TEST_LIST" \
+    --voxel-size "$VOXEL_SIZE"
 
 # ── 2. Optionally clear stale intermediate files ──────────────────────────────
 if [ "$FORCE" -eq 1 ]; then

@@ -75,7 +75,8 @@ model = dict(
         num_sem_cls=num_semantic_classes,
         stuff_cls=[0],
         thing_cls=[0],
-        output_dir='work_dirs/oneformer3d_qs_radius16_qp300_2many_run2'))
+        output_dir='work_dirs/oneformer3d_qs_radius16_qp300_2many_run2',
+        step_size=radius))
 
 # dataset settings
 dataset_type = 'ForAINetV2SegDataset_'
