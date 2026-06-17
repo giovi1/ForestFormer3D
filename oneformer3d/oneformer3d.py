@@ -2269,6 +2269,23 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             step_size = self.test_cfg.get('step_size', self.radius / 4)
             grid_size = 0.2
             num_points = 640000
+            edge_filter = self.test_cfg.get('edge_filter', True)
+            edge_margin = self.test_cfg.get('edge_margin', 0.5)
+            edge_filter_max_fraction = self.test_cfg.get(
+                'edge_filter_max_fraction', 0.0)
+            suppress_background_instances = self.test_cfg.get(
+                'suppress_background_instances', True)
+            min_instance_points = self.test_cfg.get('min_instance_points', 10)
+            debug_full_scene = self.test_cfg.get('debug_full_scene', False)
+            debug_stats = dict(
+                regions=0,
+                regions_with_tree_queries=0,
+                masks_total=0,
+                masks_after_score=0,
+                masks_after_edge=0,
+                points_assigned_before_semantic=0,
+                points_removed_by_semantic=0,
+                points_removed_as_small=0)
             pts_semantic_gt = batch_data_samples[0].eval_ann_info['pts_semantic_mask']
             pts_instance_gt = batch_data_samples[0].eval_ann_info['pts_instance_mask']
             original_points = batch_inputs_dict['points'][0]
@@ -2297,6 +2314,7 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             last_originids = None              
             #########print(f"generate regions: {(t2 - t1)*1000:.0f} ms")
             for region_idx, region in enumerate(tqdm(regions, desc="Processing regions")):
+                debug_stats['regions'] += 1
                 t2 = time.time()                 
                 region_mask = ((original_points[:, 0] - region[0]) ** 2 + (original_points[:, 1] - region[1]) ** 2) <= self.radius ** 2
                 pc1 = original_points[region_mask]
@@ -2345,6 +2363,7 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                         )
                     nn_idx_pc1 = torch.cat(nn_idx_pc1)   # (N_pc1,)
                 if tree_indices.numel() > 1:
+                    debug_stats['regions_with_tree_queries'] += 1
                     
                     # FPS from all tree points
                     batch_tensor_4 = torch.zeros(embed_logits[tree_indices].size(0), dtype=torch.long).to(embed_logits.device)  # Ensure batch_tensor on same device
@@ -2366,21 +2385,37 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                     masks = results_list[0].pts_instance_mask[0]
                     scores = results_list[0].instance_scores
                     valid_scores_mask = scores > score_th1
+                    debug_stats['masks_total'] += int(len(scores))
+                    score_keep_count = valid_scores_mask.sum()
+                    if hasattr(score_keep_count, 'item'):
+                        score_keep_count = score_keep_count.item()
+                    debug_stats['masks_after_score'] += int(score_keep_count)
 
                     # Prepare region for cylinder edge calculation
                     center = region  # assuming region is the cylinder's center (x, y)
-                    edge_threshold = self.radius - 0.5  # Distance to cylinder edge threshold (0.5m from the edge)
+                    edge_threshold = self.radius - edge_margin
 
                     # Compute distances to cylinder center for all points
-                    pc3_distances = torch.sqrt((pc3[:, 0] - center[0]) ** 2 + (pc3[:, 1] - center[1]) ** 2)
+                    if edge_filter:
+                        pc3_distances = torch.sqrt(
+                            (pc3[:, 0] - center[0]) ** 2 +
+                            (pc3[:, 1] - center[1]) ** 2)
                     t7_2 = time.time() 
                     #########print(f"postprocessing 1 step2: {(t7_2 - t7_1)*1000:.0f} ms")
                     valid_scores_mask2 = np.ones_like(valid_scores_mask, dtype=bool)  # Initialize mask (all True)
-                    for i, mask in enumerate(masks):
-                        if valid_scores_mask[i]:  # Only check valid masks (with scores > 0.6)
-                            # Check if any point in the mask is too close to the edge
-                            if torch.any(pc3_distances[mask] > edge_threshold):
-                                valid_scores_mask2[i] = False  # Invalidate this mask if any point is near the edge
+                    if edge_filter:
+                        for i, mask in enumerate(masks):
+                            if valid_scores_mask[i]:
+                                edge_fraction = (
+                                    pc3_distances[mask] > edge_threshold
+                                ).float().mean()
+                                if edge_fraction > edge_filter_max_fraction:
+                                    valid_scores_mask2[i] = False
+                    final_keep_mask = (
+                        torch.tensor(valid_scores_mask, device=pc3.device) &
+                        torch.tensor(valid_scores_mask2, device=pc3.device))
+                    debug_stats['masks_after_edge'] += int(
+                        final_keep_mask.sum().item())
                     t8 = time.time()                 
                     #########print(f"postprocessing 1: {(t8 - t7)*1000:.0f} ms")  
                     ####### Apply both score and edge distance filtering
@@ -2407,8 +2442,7 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                         #max_instance += 1'''
 
                     keep = torch.where(
-                        torch.tensor(valid_scores_mask, device=pc3.device) &
-                        torch.tensor(valid_scores_mask2, device=pc3.device)
+                        final_keep_mask
                     )[0]                                            # (K,)
 
                     if keep.numel():
@@ -2431,37 +2465,55 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                             rows_list.append(rows_chunk)
                             cols_list.append(cols_chunk)
 
-                        rows = torch.cat(rows_list, dim=0)
-                        cols = torch.cat(cols_list, dim=0)     
-                        score_per_hit = scores_kept[rows]               # (nnz,)
+                        if rows_list and cols_list:
+                            rows = torch.cat(rows_list, dim=0)
+                            cols = torch.cat(cols_list, dim=0)
+                        else:
+                            rows = torch.empty(
+                                0, dtype=torch.long, device=pc3.device)
+                            cols = torch.empty(
+                                0, dtype=torch.long, device=pc3.device)
 
-                        N1 = pc1.shape[0]
-                        best_score = torch.full((N1,), -1., device=pc3.device)
-                        best_mid   = torch.full((N1,), -1 , dtype=torch.long, device=pc3.device)
+                        if rows.numel():
+                            score_per_hit = scores_kept[rows]           # (nnz,)
 
-                        best_score.index_reduce_(0, cols, score_per_hit, reduce='amax')
-                        improved_mask = score_per_hit == best_score[cols]
-                        best_mid.index_put_((cols[improved_mask],),
-                                            rows[improved_mask], accumulate=False)
+                            N1 = pc1.shape[0]
+                            best_score = torch.full(
+                                (N1,), -1., device=pc3.device)
+                            best_mid = torch.full(
+                                (N1,), -1, dtype=torch.long,
+                                device=pc3.device)
 
-                        pts_glob   = pc1_indices.cpu().numpy()
-                        new_scores = best_score.cpu().numpy()
-                        better_pts = new_scores > global_instance_scores[pts_glob]
+                            best_score.index_reduce_(
+                                0, cols, score_per_hit, reduce='amax')
+                            improved_mask = score_per_hit == best_score[cols]
+                            best_mid.index_put_((cols[improved_mask],),
+                                                rows[improved_mask],
+                                                accumulate=False)
 
-                        if better_pts.any():
-                            global_instance_scores[pts_glob[better_pts]] = new_scores[better_pts]
-                            all_pre_ins[pts_glob[better_pts]] = (
-                                max_instance + best_mid.cpu().numpy()[better_pts]
-                            )
+                            pts_glob = pc1_indices.cpu().numpy()
+                            new_scores = best_score.cpu().numpy()
+                            better_pts = (
+                                new_scores > global_instance_scores[pts_glob])
 
-                            mids_unique = np.unique(best_mid.cpu().numpy()[better_pts])
-                            for mid in mids_unique:
-                                sel_pts = (cols[rows == mid]).cpu().numpy()      
-                                best_masks.append(
-                                    (pts_glob[sel_pts],
-                                    max_instance + int(mid),
-                                    float(scores_kept[int(mid)]))
+                            if better_pts.any():
+                                global_instance_scores[pts_glob[better_pts]] = new_scores[better_pts]
+                                all_pre_ins[pts_glob[better_pts]] = (
+                                    max_instance +
+                                    best_mid.cpu().numpy()[better_pts]
                                 )
+
+                                mids_unique = np.unique(
+                                    best_mid.cpu().numpy()[better_pts])
+                                for mid in mids_unique:
+                                    if mid < 0:
+                                        continue
+                                    sel_pts = (cols[rows == mid]).cpu().numpy()
+                                    best_masks.append(
+                                        (pts_glob[sel_pts],
+                                         max_instance + int(mid),
+                                         float(scores_kept[int(mid)]))
+                                    )
 
                         max_instance += int(masks_kept.size(0))        
                     t9 = time.time()                 
@@ -2532,7 +2584,13 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             final_semantic_labels[votes_counter.sum(1) == 0] = -1  
             ground_mask = (final_semantic_labels == 0)
 
-            all_pre_ins[ground_mask] = -1
+            debug_stats['points_assigned_before_semantic'] = int(
+                np.sum(all_pre_ins != -1))
+            if suppress_background_instances:
+                points_before_semantic = int(np.sum(all_pre_ins != -1))
+                all_pre_ins[ground_mask] = -1
+                debug_stats['points_removed_by_semantic'] = (
+                    points_before_semantic - int(np.sum(all_pre_ins != -1)))
             t11 = time.time()                 
             #print(f"postprocessing 5: {(t11 - t10)*1000:.0f} ms") 
             # Remove instances with fewer than 10 points
@@ -2543,7 +2601,10 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             t11 = time.time()     
             # Remove instances with fewer than 10 points  
             uniq, cnt = np.unique(all_pre_ins, return_counts=True)
-            to_kill   = np.isin(all_pre_ins, uniq[(cnt < 10) & (uniq != -1)])
+            to_kill   = np.isin(
+                all_pre_ins,
+                uniq[(cnt < min_instance_points) & (uniq != -1)])
+            debug_stats['points_removed_as_small'] = int(np.sum(to_kill))
             all_pre_ins[to_kill] = -1
             t12 = time.time()
             print(f"postprocessing 6: {(t12 - t11)*1000:.0f} ms")
@@ -2558,6 +2619,12 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             clean_all_pre_ins, merged_masks, merged_instance_scores = self.merge_overlapping_instances_by_score_speedup(all_pre_ins, unique_best_masks,overlap_threshold=score_th2)
             t14 = time.time()                 
             print(f"postprocessing 8: {(t14 - t13)*1000:.0f} ms")
+            if debug_full_scene:
+                debug_stats['instances_before_merge'] = int(
+                    np.sum(np.unique(all_pre_ins) >= 0))
+                debug_stats['instances_after_merge'] = int(
+                    np.sum(np.unique(clean_all_pre_ins) >= 0))
+                print(f"full_scene_debug {current_filename}: {debug_stats}")
             # Re-label instances to ensure continuous labeling
             unique_labels = np.unique(clean_all_pre_ins)
             unique_labels = unique_labels[unique_labels >= 0]  # Exclude background label (-1)

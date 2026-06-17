@@ -1,3 +1,30 @@
 # Ignore Python bytecode
 *.pyc
 __pycache__/
+
+# Local datasets, symlinks, and metadata drops
+/data/
+/data-test/
+/TreeScanPL10k
+/individual_tree_summary.csv
+/plot_summary.xlsx
+/species_id_names.csv
+/torch
+
+# Generated experiment outputs
+/work_dirs/
+/results/**
+!/results/
+!/results/**/
+!/results/**/README.md
+
+# Large point-cloud/model artifacts
+*.ply
+*.laz
+*.las
+*.npy
+*.bin
+*.pth
+
+# Local editor state
+/.idea/
