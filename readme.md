@@ -12,6 +12,176 @@ This is the official implementation of the paper:
 
 ---
 
+## Changes in this fork
+
+This fork extends the original ForestFormer3D codebase for TreeScanPL10K
+experiments. The original model and ForAINetV2 pipeline are kept as the base,
+while the added work focuses on making ForestFormer3D usable for LAZ/LAS forest
+scans, comparing zero-shot inference against TreeScan fine-tuning, and
+documenting the ablations needed to justify the final configuration.
+
+### Codebase changes
+
+- Fixed the `spconv` checkpoint workflow so `_fix.pth` checkpoints are not
+  permuted twice during testing. Use `tools/fix_spconv_checkpoint.py` once when
+  converting a trained checkpoint, then load the repaired checkpoint directly
+  with `tools/test.py`.
+- Fixed full-scene inference/evaluation so metrics receive full-cloud
+  predictions instead of only the final processed cylinder.
+- Made inference output less dependent on local hard-coded paths by adding
+  configurable output directories and safer test-mode logic.
+- Added LAZ/LAS inference support through `laz_inference/convert.py` and
+  `laz_inference/infer.sh`. This path converts TreeScan-style `.laz`/`.las`
+  files into the existing ForAINetV2-compatible format, regenerates metadata,
+  runs ForestFormer3D, and writes predicted `.ply` files.
+- Added quick inspection/evaluation helpers such as `tools/eval_instance_seg.py`
+  and `tools/compare_semantic.py`.
+- Developed TreeScanPL10K fine-tuning utilities on the
+  `ft/treescan-finetuning` branch:
+  `configs/oneformer3d_treescan_finetune.py`,
+  `configs/oneformer3d_treescan_finetune_smoke.py`,
+  `tools/prepare_treescan_finetune.py`,
+  `tools/fix_treescan_info_labels.py`, and
+  `tools/run_treescan_finetune_after_prepare.sh`.
+
+### TreeScanPL10K inference
+
+Run zero-shot TreeScan inference from inside the Docker container at
+`/workspace`:
+
+```bash
+bash laz_inference/infer.sh \
+  --input-dir /data/TreeScanPL10k/batch_01/ \
+  --voxel-size 0.7 \
+  --gpu 0 \
+  --force
+```
+
+The script writes converted inputs under `data-test/`, updates the test
+metadata, runs `tools/test.py`, and saves predictions in
+`work_dirs/oneformer3d_qs_radius16_qp300_2many/`.
+
+### TreeScanPL10K fine-tuning workflow
+
+Run this workflow from the `ft/treescan-finetuning` branch, or after merging
+the listed fine-tuning files into the branch you are using.
+
+The TreeScan fine-tuning setup keeps the ForestFormer3D head compatible with
+the original ForAINetV2 checkpoint. TreeScan labels are mapped as background
+and tree instances; the unused ForAINetV2 class slot remains only to preserve
+checkpoint compatibility.
+
+Prepare the TreeScan training root:
+
+```bash
+python tools/prepare_treescan_finetune.py \
+  --input-dir /data/TreeScanPL10k/batch_01 \
+  --data-root data/TreeScanPL10K \
+  --voxel-size 0.1
+```
+
+Generate metadata through the existing ForAINetV2-compatible loader:
+
+```bash
+cd data/TreeScanPL10K
+python /workspace/data/ForAINetV2/batch_load_ForAINetV2_data.py \
+  --train_scan_names_file meta_data/train_list.txt \
+  --val_scan_names_file meta_data/val_list.txt \
+  --test_scan_names_file meta_data/test_list.txt \
+  --train_forainetv2_dir train_val_data \
+  --test_forainetv2_dir test_data \
+  --output_folder forainetv2_instance_data
+
+cd /workspace
+python tools/create_data_forainetv2.py forainetv2 \
+  --root-path data/TreeScanPL10K \
+  --out-dir data/TreeScanPL10K
+
+python tools/fix_treescan_info_labels.py \
+  --data-root data/TreeScanPL10K \
+  --backup
+```
+
+Run a smoke test before the full fine-tune:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+  configs/oneformer3d_treescan_finetune_smoke.py \
+  --work-dir work_dirs/treescan_finetune_voxel_0_1_smoke
+```
+
+Then run the main fine-tune:
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+  configs/oneformer3d_treescan_finetune.py \
+  --work-dir work_dirs/treescan_finetune_voxel_0_1_decoder
+```
+
+For TreeScan, keep `model.prepare_epoch=-1`. The upstream-style
+`prepare_epoch=1000` delays decoder losses beyond the short TreeScan fine-tune
+and substantially reduces instance segmentation quality.
+
+Repair the selected checkpoint before final evaluation:
+
+```bash
+python tools/fix_spconv_checkpoint.py \
+  --in-path work_dirs/treescan_finetune_voxel_0_1_decoder/best_mRQ_epoch_45.pth \
+  --out-path work_dirs/treescan_finetune_voxel_0_1_decoder/best_mRQ_epoch_45_spconv_fix.pth
+```
+
+### Ablation results
+
+All TreeScan results below use the same TreeScan dataset split and evaluator so
+the original ForestFormer3D checkpoint can be compared directly with the
+fine-tuned model. A machine-readable summary is stored in
+`results/treescan_ablation_summary.json`.
+
+| Run | Checkpoint/settings | mIoU | mPQ | mRQ/F1 | Precision | Recall |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Zero-shot ForestFormer3D | `epoch_3000_fix.pth` | 0.2552 | 0.3485 | 0.4730 | 0.3914 | 0.5976 |
+| TreeScan fine-tuned baseline | `best_mRQ_epoch_45_spconv_fix.pth` | 0.7016 | 0.6386 | 0.7708 | 0.7595 | 0.7824 |
+| Validation-selected threshold T2 | fine-tuned + threshold tuning | 0.7010 | 0.6453 | 0.7741 | 0.7979 | 0.7516 |
+| No decoder-loss ablation | `model.prepare_epoch=1000` | 0.6699 | 0.4364 | 0.5844 | 0.6614 | 0.5234 |
+
+The threshold setting selected on validation is:
+
+```bash
+model.score_th=0.35
+model.test_cfg.sp_score_thr=0.1
+model.test_cfg.npoint_thr=10
+model.test_cfg.min_instance_points=10
+```
+
+These are inference/post-processing thresholds inherited from the original
+ForestFormer3D/ForAINet-style instance prediction path. They control which
+predicted masks survive confidence, superpoint score, and minimum-size
+filtering. They are not new labels or training losses.
+
+Run the selected threshold once on held-out test:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/test.py \
+  configs/oneformer3d_treescan_finetune.py \
+  work_dirs/treescan_finetune_voxel_0_1_decoder/best_mRQ_epoch_45_spconv_fix.pth \
+  --work-dir work_dirs/ablation/T2_threshold_precision_test \
+  --cfg-options \
+    model.score_th=0.35 \
+    model.test_cfg.sp_score_thr=0.1 \
+    model.test_cfg.npoint_thr=10 \
+    model.test_cfg.min_instance_points=10
+```
+
+The ablation supports two conclusions. First, fine-tuning is necessary for
+TreeScanPL10K because zero-shot transfer from the original ForestFormer3D
+checkpoint has much lower panoptic quality and recognition quality. Second,
+decoder fine-tuning is the main contributor to the gain: disabling decoder
+losses keeps semantic/coverage behavior partially useful but sharply reduces
+instance recognition and panoptic quality.
+
+---
+
 ## 📚 Citation
 
 If you find this project helpful, please cite our paper:

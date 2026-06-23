@@ -1,0 +1,129 @@
+{
+  "dataset": "TreeScanPL10K",
+  "split": "held-out test unless otherwise stated",
+  "base_model": "ForestFormer3D",
+  "notes": [
+    "Zero-shot uses the original ForestFormer3D checkpoint with the TreeScan fine-tuning config so dataset, split, voxel size, and evaluator match the fine-tuned runs.",
+    "T2 was selected on validation before being run once on held-out test.",
+    "The no-decoder ablation sets model.prepare_epoch=1000, which prevents instance decoder losses from running during the short TreeScan fine-tune."
+  ],
+  "selected_validation_threshold": {
+    "name": "T2_threshold_precision",
+    "cfg_options": {
+      "model.score_th": 0.35,
+      "model.test_cfg.sp_score_thr": 0.1,
+      "model.test_cfg.npoint_thr": 10,
+      "model.test_cfg.min_instance_points": 10
+    },
+    "selection_reason": "Best validation mRQ/F1 and mPQ among tested threshold settings."
+  },
+  "runs": {
+    "A0_zeroshot_test": {
+      "source_json": "work_dirs/ablation/A0_zeroshot_test/20260622_091851/20260622_091851.json",
+      "checkpoint": "work_dirs/clean_forestformer/epoch_3000_fix.pth",
+      "description": "Original ForestFormer3D checkpoint evaluated zero-shot on TreeScanPL10K.",
+      "metrics": {
+        "mIoU": 0.25522307372083486,
+        "mIoU_binary": 0.5422092234122666,
+        "mMWCov": 0.5945560166359283,
+        "mMUCov": 0.5612501520543407,
+        "mPrecision": 0.39138405132726223,
+        "mRecall": 0.5976207137816822,
+        "F1": 0.4729991644200094,
+        "mPQ": 0.3484558806187388,
+        "mSQ": 0.7366944951076492,
+        "mRQ": 0.4729991644200094
+      }
+    },
+    "A1_finetuned_test": {
+      "source_json": "work_dirs/ablation/A1_finetuned_test/20260622_093457/20260622_093457.json",
+      "checkpoint": "work_dirs/treescan_finetune_voxel_0_1_decoder/best_mRQ_epoch_45_spconv_fix.pth",
+      "description": "TreeScan fine-tuned checkpoint with baseline inference thresholds.",
+      "metrics": {
+        "mIoU": 0.7015525519548935,
+        "mIoU_binary": 0.7015525519548935,
+        "mMWCov": 0.7672164338694029,
+        "mMUCov": 0.7259940610129701,
+        "mPrecision": 0.7595108695600578,
+        "mRecall": 0.7823652904074013,
+        "F1": 0.7707686954439062,
+        "mPQ": 0.6385986653910158,
+        "mSQ": 0.8285217979996318,
+        "mRQ": 0.7707686954439062
+      }
+    },
+    "T2_threshold_precision_val": {
+      "source_json": "work_dirs/ablation/T2_threshold_precision_val/20260622_110111/20260622_110111.json",
+      "checkpoint": "work_dirs/treescan_finetune_voxel_0_1_decoder/best_mRQ_epoch_45_spconv_fix.pth",
+      "description": "Validation run used to select the final inference threshold.",
+      "metrics": {
+        "mIoU": 0.7220774534799084,
+        "mMWCov": 0.7558823569549052,
+        "mMUCov": 0.6931133435095073,
+        "mPrecision": 0.8510948905047366,
+        "mRecall": 0.7862440997924057,
+        "F1": 0.8173852035545149,
+        "mPQ": 0.6860106644679794,
+        "mSQ": 0.8392746302291321,
+        "mRQ": 0.8173852035545149
+      }
+    },
+    "T2_threshold_precision_test": {
+      "source_json": "work_dirs/ablation/T2_threshold_precision_test/20260622_114920/20260622_114920.json",
+      "checkpoint": "work_dirs/treescan_finetune_voxel_0_1_decoder/best_mRQ_epoch_45_spconv_fix.pth",
+      "description": "Final threshold-selected fine-tuned run evaluated once on held-out test.",
+      "metrics": {
+        "mIoU": 0.7010358233159152,
+        "mIoU_binary": 0.7010358233159152,
+        "mMWCov": 0.7547920886738694,
+        "mMUCov": 0.7021870741297527,
+        "mPrecision": 0.7979197622526158,
+        "mRecall": 0.751574527636448,
+        "F1": 0.7740540490529484,
+        "mPQ": 0.6453332023813109,
+        "mSQ": 0.8337056090215833,
+        "mRQ": 0.7740540490529484
+      }
+    },
+    "A4_no_decoder_prepare1000_test": {
+      "source_json": "work_dirs/ablation/A4_no_decoder_prepare1000_test/20260622_151010/20260622_151010.json",
+      "checkpoint": "work_dirs/ablation/A4_no_decoder_prepare1000/best_mRQ_epoch_35_spconv_fix.pth",
+      "description": "Decoder fine-tuning ablation with model.prepare_epoch=1000.",
+      "metrics": {
+        "mIoU": 0.6698874341332806,
+        "mIoU_binary": 0.7091139200654569,
+        "mMWCov": 0.5759438308929865,
+        "mMUCov": 0.5157742025157384,
+        "mPrecision": 0.6613616268730207,
+        "mRecall": 0.5234429671062041,
+        "F1": 0.5843749950631868,
+        "mPQ": 0.4364245659973296,
+        "mSQ": 0.746822793042574,
+        "mRQ": 0.5843749950631868
+      }
+    }
+  },
+  "main_comparisons": {
+    "finetuned_baseline_minus_zeroshot": {
+      "delta_mIoU": 0.4463294782340586,
+      "delta_mPQ": 0.290142784772277,
+      "delta_mRQ": 0.2977695310238968,
+      "delta_mPrecision": 0.3681268182327956,
+      "delta_mRecall": 0.18474457662571912
+    },
+    "threshold_t2_minus_finetuned_baseline": {
+      "delta_mIoU": -0.0005167286389782975,
+      "delta_mPQ": 0.006734536990295059,
+      "delta_mRQ": 0.003285353609042174,
+      "delta_mPrecision": 0.038408892692557964,
+      "delta_mRecall": -0.030790762770953365
+    },
+    "finetuned_baseline_minus_no_decoder": {
+      "delta_mIoU": 0.031665117821612896,
+      "delta_mPQ": 0.20217409939368618,
+      "delta_mRQ": 0.18639370038071936,
+      "delta_mPrecision": 0.09814924268703716,
+      "delta_mRecall": 0.25892232330119716
+    }
+  }
+}
