@@ -1,3 +1,19 @@
 # Ignore Python bytecode
 *.pyc
 __pycache__/
+
+# Ignore generated experiment artifacts and large point-cloud/checkpoint files
+*.pth
+*.laz
+*.ply
+.idea/
+TreeScanPL10k
+data-test/
+data/TreeScanPL10K/
+data/ForAINetV2/forainetv2_instance_data/
+data/ForAINetV2/*_oneformer3d_infos_*.pkl
+data/ForAINetV2/instance_mask/
+data/ForAINetV2/points/
+data/ForAINetV2/semantic_mask/
+results/
+work_dirs/

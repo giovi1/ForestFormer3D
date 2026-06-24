@@ -17,6 +17,7 @@ from torch_cluster import fps
 import re
 import math
 import collections 
+from mmengine.logging import MMLogger
 
 # This is the full refactored version using ThreadPoolExecutor for parallel region inference
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1763,7 +1764,8 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                  #prepare_epoch2=None,
                  radius = 16,
                  score_th = 0.4,
-                 chunk = 20_000):
+                 chunk = 20_000,
+                 query_selection=None):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         self.unet = MODELS.build(backbone)
@@ -1781,7 +1783,12 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         self._init_layers(in_channels, num_channels)
         self.Embed = Seq().append(MLP([num_channels, num_channels], bias=False))
         self.Embed.append(torch.nn.Linear(num_channels, 5))
-        self.query_point_num = query_point_num
+        self.query_selection = self._init_query_selection(
+            query_selection, query_point_num)
+        self.query_point_num = self.query_selection['num_queries']
+        self.query_selection_mode = self.query_selection['mode']
+        self._query_selection_calls = 0
+        self._query_selection_stats = collections.defaultdict(float)
         self.radius = radius
         self.score_th = score_th
         self.chunk = chunk
@@ -1791,6 +1798,285 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             .append(torch.nn.Linear(num_channels, 2))  
             .append(torch.nn.LogSoftmax(dim=-1))  
         )
+
+    def _init_query_selection(self, query_selection, query_point_num):
+        cfg = dict(
+            mode='isa',
+            num_queries=query_point_num,
+            isa_ratio=0.34,
+            multiscale_ratio=0.33,
+            density_ratio=0.33,
+            density_sampling_mode='balanced',
+            density_deterministic=True,
+            density_k=16,
+            density_eps=1e-6,
+            deduplicate_queries=True,
+            fallback_to_isa=True,
+            log_interval=100)
+        if query_selection is not None:
+            cfg.update(dict(query_selection))
+
+        valid_modes = {'isa', 'multiscale', 'density', 'ms_disa'}
+        if cfg['mode'] not in valid_modes:
+            raise ValueError(
+                f"Unsupported query_selection mode {cfg['mode']}. "
+                f"Expected one of {sorted(valid_modes)}.")
+        valid_density_modes = {'low_density', 'high_density', 'balanced'}
+        if cfg['density_sampling_mode'] not in valid_density_modes:
+            raise ValueError(
+                "density_sampling_mode must be one of "
+                f"{sorted(valid_density_modes)}.")
+
+        cfg['num_queries'] = int(cfg['num_queries'])
+        cfg['density_deterministic'] = bool(cfg['density_deterministic'])
+        cfg['density_k'] = int(cfg['density_k'])
+        cfg['log_interval'] = int(cfg.get('log_interval', 0))
+        return cfg
+
+    def _active_query_counts(self, total_queries):
+        mode = self.query_selection_mode
+        if mode == 'isa':
+            return dict(isa=total_queries, multiscale=0, density=0)
+
+        active = ['isa']
+        if mode in ('multiscale', 'ms_disa'):
+            active.append('multiscale')
+        if mode in ('density', 'ms_disa'):
+            active.append('density')
+
+        ratio_keys = dict(
+            isa='isa_ratio',
+            multiscale='multiscale_ratio',
+            density='density_ratio')
+        ratios = {
+            name: max(float(self.query_selection[ratio_keys[name]]), 0.0)
+            for name in active
+        }
+        ratio_sum = sum(ratios.values())
+        if ratio_sum <= 0:
+            ratios = {name: 1.0 for name in active}
+            ratio_sum = float(len(active))
+
+        raw = {
+            name: total_queries * ratios[name] / ratio_sum
+            for name in active
+        }
+        counts = {name: int(math.floor(raw[name])) for name in active}
+        remainder = total_queries - sum(counts.values())
+        order = sorted(active, key=lambda name: raw[name] - counts[name],
+                       reverse=True)
+        for name in order[:remainder]:
+            counts[name] += 1
+
+        return dict(
+            isa=counts.get('isa', 0),
+            multiscale=counts.get('multiscale', 0),
+            density=counts.get('density', 0))
+
+    def _fps_select_query_indices(self, values, candidate_indices, count):
+        if count <= 0 or candidate_indices.numel() == 0:
+            return candidate_indices.new_empty((0,))
+        if count >= candidate_indices.numel():
+            return candidate_indices
+
+        local_values = values[candidate_indices]
+        batch = torch.zeros(
+            local_values.size(0), dtype=torch.long, device=local_values.device)
+        ratio = min(float(count) / float(local_values.size(0)), 1.0)
+        local_idx = fps(local_values, batch, ratio=ratio)
+        selected = candidate_indices[local_idx]
+        return selected[:count]
+
+    def _deduplicate_query_indices(self, indices):
+        if indices.numel() <= 1:
+            return indices, 0
+        seen = set()
+        keep = []
+        for idx in indices.detach().cpu().tolist():
+            if idx in seen:
+                continue
+            seen.add(idx)
+            keep.append(idx)
+        deduped = indices.new_tensor(keep)
+        return deduped, int(indices.numel() - deduped.numel())
+
+    def _candidate_density(self, candidate_xyz):
+        if candidate_xyz is None or candidate_xyz.numel() == 0:
+            return None
+        density_k = max(int(self.query_selection['density_k']), 1)
+        cell_scale = max(round(density_k ** (1.0 / 3.0)), 1)
+        cell_size = max(float(self.voxel_size) * cell_scale,
+                        float(self.voxel_size))
+        xyz = candidate_xyz.float()
+        grid = torch.floor((xyz - xyz.min(0).values) / cell_size).long()
+        _, inverse, counts = torch.unique(
+            grid, dim=0, return_inverse=True, return_counts=True)
+        return counts[inverse].float()
+
+    def _density_weights(self, candidate_density):
+        eps = float(self.query_selection['density_eps'])
+        d_min = candidate_density.min()
+        d_max = candidate_density.max()
+        norm = (candidate_density - d_min) / (d_max - d_min + eps)
+        mode = self.query_selection['density_sampling_mode']
+        if mode == 'low_density':
+            return 1.0 - norm + eps
+        if mode == 'high_density':
+            return norm + eps
+        # Balanced mode keeps a uniform component while still protecting sparse
+        # tree candidates. A future variant can add an explicit complexity term.
+        return 0.5 * (1.0 - norm) + 0.5 + eps
+
+    def _density_select_query_indices(self, candidate_indices, candidate_xyz,
+                                      count):
+        if count <= 0 or candidate_indices.numel() == 0:
+            return candidate_indices.new_empty((0,)), None
+        candidate_density = self._candidate_density(candidate_xyz)
+        if candidate_density is None:
+            return candidate_indices[:min(count, candidate_indices.numel())], None
+
+        weights = self._density_weights(candidate_density)
+        num_samples = min(count, candidate_indices.numel())
+        if torch.sum(weights) <= 0:
+            local_idx = torch.arange(num_samples, device=candidate_indices.device)
+        elif self.query_selection.get('density_deterministic', True):
+            local_idx = torch.topk(weights, k=num_samples, largest=True).indices
+        else:
+            local_idx = torch.multinomial(
+                weights, num_samples=num_samples, replacement=False)
+        return candidate_indices[local_idx], candidate_density
+
+    def _filter_unselected_candidates(self, candidate_indices, selected):
+        if selected.numel() == 0:
+            return candidate_indices
+        return candidate_indices[~torch.isin(candidate_indices, selected)]
+
+    def _fill_query_indices(self, selected, candidate_indices, embed_logits,
+                            total_queries, stats):
+        if selected.numel() >= total_queries:
+            return selected[:total_queries]
+        if candidate_indices.numel() == 0:
+            return selected
+
+        if self.query_selection.get('fallback_to_isa', True):
+            remaining = self._filter_unselected_candidates(
+                candidate_indices, selected)
+            need = total_queries - selected.numel()
+            fill = self._fps_select_query_indices(embed_logits, remaining, need)
+            if fill.numel() > 0:
+                selected = torch.cat([selected, fill], dim=0)
+                stats['fallback_count'] += int(fill.numel())
+
+        if (self.query_selection.get('deduplicate_queries', True)
+                and selected.numel() > total_queries):
+            selected, removed = self._deduplicate_query_indices(selected)
+            stats['duplicates_removed'] += removed
+
+        if selected.numel() >= total_queries:
+            return selected[:total_queries]
+
+        # Last-resort padding keeps the decoder query count stable for the new
+        # experimental modes when there are fewer unique candidates than K.
+        need = total_queries - selected.numel()
+        source = candidate_indices if candidate_indices.numel() > 0 else selected
+        if source.numel() > 0:
+            pad_idx = torch.arange(need, device=source.device) % source.numel()
+            selected = torch.cat([selected, source[pad_idx]], dim=0)
+            stats['fallback_count'] += int(need)
+        return selected[:total_queries]
+
+    def _select_query_indices(self, embed_logits, candidate_indices,
+                              candidate_xyz=None):
+        total_queries = self.query_point_num
+        stats = dict(
+            requested_queries=total_queries,
+            selected_isa=0,
+            selected_multiscale=0,
+            selected_density=0,
+            duplicates_removed=0,
+            fallback_count=0,
+            avg_selected_density=0.0)
+
+        if candidate_indices.numel() == 0:
+            self._record_query_selection_stats(stats)
+            return candidate_indices
+
+        counts = self._active_query_counts(total_queries)
+        selected_parts = []
+
+        isa_selected = self._fps_select_query_indices(
+            embed_logits, candidate_indices, counts['isa'])
+        selected_parts.append(isa_selected)
+        stats['selected_isa'] = int(isa_selected.numel())
+
+        if counts['multiscale'] > 0:
+            # The first multi-scale view uses XYZ-space FPS to complement ISA's
+            # embedding-space FPS with direct spatial coverage.
+            if candidate_xyz is not None:
+                xyz_selected = self._fps_select_query_indices(
+                    candidate_xyz, candidate_indices, counts['multiscale'])
+            else:
+                xyz_selected = self._fps_select_query_indices(
+                    embed_logits, candidate_indices, counts['multiscale'])
+            selected_parts.append(xyz_selected)
+            stats['selected_multiscale'] = int(xyz_selected.numel())
+
+        candidate_density = None
+        if counts['density'] > 0:
+            density_selected, candidate_density = (
+                self._density_select_query_indices(
+                    candidate_indices,
+                    None if candidate_xyz is None
+                    else candidate_xyz[candidate_indices],
+                    counts['density']))
+            selected_parts.append(density_selected)
+            stats['selected_density'] = int(density_selected.numel())
+
+        selected = torch.cat(selected_parts, dim=0)
+        if self.query_selection.get('deduplicate_queries', True):
+            selected, removed = self._deduplicate_query_indices(selected)
+            stats['duplicates_removed'] += removed
+
+        selected = self._fill_query_indices(
+            selected, candidate_indices, embed_logits, total_queries, stats)
+
+        if candidate_density is not None and selected.numel() > 0:
+            selected_mask = torch.isin(candidate_indices, selected)
+            if torch.any(selected_mask):
+                stats['avg_selected_density'] = float(
+                    candidate_density[selected_mask].float().mean().item())
+
+        self._record_query_selection_stats(stats)
+        return selected
+
+    def _record_query_selection_stats(self, stats):
+        if self.query_selection_mode == 'isa':
+            return
+        interval = self.query_selection.get('log_interval', 0)
+        if interval <= 0:
+            return
+
+        self._query_selection_calls += 1
+        for key, value in stats.items():
+            self._query_selection_stats[key] += float(value)
+        if self._query_selection_calls % interval != 0:
+            return
+
+        denom = float(interval)
+        logger = MMLogger.get_current_instance()
+        logger.info(
+            "query_selection_mode=%s requested=%.1f isa=%.1f "
+            "multiscale=%.1f density=%.1f duplicates_removed=%.1f "
+            "fallback=%.1f avg_selected_density=%.4f",
+            self.query_selection_mode,
+            self._query_selection_stats['requested_queries'] / denom,
+            self._query_selection_stats['selected_isa'] / denom,
+            self._query_selection_stats['selected_multiscale'] / denom,
+            self._query_selection_stats['selected_density'] / denom,
+            self._query_selection_stats['duplicates_removed'] / denom,
+            self._query_selection_stats['fallback_count'] / denom,
+            self._query_selection_stats['avg_selected_density'] / denom)
+        self._query_selection_stats.clear()
     
     def _init_layers(self, in_channels, num_channels):
         self.input_conv = spconv.SparseSequential(
@@ -1991,16 +2277,27 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                         semantic_predictions_bi = torch.argmax(bi_semantic_logits[i], dim=1)
                         tree_indices = torch.where(semantic_predictions_bi == wood_class)[0]  #all voxel
                         
-                        #FPS from all tree points
-                        batch_tensor_4 = torch.zeros(embed_logits[i][tree_indices].size(0), dtype=torch.long).to(embed_logits[i].device)  # Ensure batch_tensor on same device
-                        topk_indices_4 = fps(embed_logits[i][tree_indices], batch_tensor_4, ratio=min(self.query_point_num / embed_logits[i][tree_indices].size(0), torch.tensor([1.0]).to(embed_logits[i].device)))
-                        selected_indices_case4 = tree_indices[topk_indices_4]
-
-                        # Retrieve relevant information for the selected points
-                        current_points = batch_inputs_dict['points'][i]
-                        current_points_add = scatter_add(current_points, voxel_superpoints, dim=0)
-                        voxel_counts = scatter_add(torch.ones_like(current_points[:, 0].float()), voxel_superpoints, dim=0)
-                        avg_points = current_points_add / voxel_counts.unsqueeze(-1).clamp(min=1)
+                        if self.query_selection_mode == 'isa':
+                            # Baseline ISA-FPS from all predicted tree voxels.
+                            batch_tensor_4 = torch.zeros(embed_logits[i][tree_indices].size(0), dtype=torch.long).to(embed_logits[i].device)  # Ensure batch_tensor on same device
+                            topk_indices_4 = fps(embed_logits[i][tree_indices], batch_tensor_4, ratio=min(self.query_point_num / embed_logits[i][tree_indices].size(0), torch.tensor([1.0]).to(embed_logits[i].device)))
+                            selected_indices_case4 = tree_indices[topk_indices_4]
+                        else:
+                            current_points = batch_inputs_dict['points'][i]
+                            current_points_add = scatter_add(
+                                current_points[:, :3],
+                                voxel_superpoints,
+                                dim=0,
+                                dim_size=embed_logits[i].size(0))
+                            voxel_counts = scatter_add(
+                                torch.ones_like(current_points[:, 0].float()),
+                                voxel_superpoints,
+                                dim=0,
+                                dim_size=embed_logits[i].size(0))
+                            avg_points = current_points_add / \
+                                voxel_counts.unsqueeze(-1).clamp(min=1)
+                            selected_indices_case4 = self._select_query_indices(
+                                embed_logits[i], tree_indices, avg_points)
 
                         # add content queries
                         queries.append(x[i][selected_indices_case4])
@@ -2149,10 +2446,19 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                     
                 if tree_indices.numel() > 0:
                     
-                    # FPS from all tree points
-                    batch_tensor_4 = torch.zeros(embed_logits[tree_indices].size(0), dtype=torch.long).to(embed_logits.device)  # Ensure batch_tensor on same device
-                    topk_indices_4 = fps(embed_logits[tree_indices], batch_tensor_4, ratio=min(self.query_point_num / embed_logits[tree_indices].size(0), torch.tensor([1.0]).to(embed_logits.device)))
-                    selected_indices_case4 = tree_indices[topk_indices_4]
+                    if self.query_selection_mode == 'isa':
+                        # Baseline ISA-FPS from all predicted tree voxels.
+                        batch_tensor_4 = torch.zeros(embed_logits[tree_indices].size(0), dtype=torch.long).to(embed_logits.device)  # Ensure batch_tensor on same device
+                        topk_indices_4 = fps(embed_logits[tree_indices], batch_tensor_4, ratio=min(self.query_point_num / embed_logits[tree_indices].size(0), torch.tensor([1.0]).to(embed_logits.device)))
+                        selected_indices_case4 = tree_indices[topk_indices_4]
+                    else:
+                        voxel_xyz = scatter_mean(
+                            pc3[:, :3],
+                            inverse_mapping2,
+                            dim=0,
+                            dim_size=embed_logits.size(0))
+                        selected_indices_case4 = self._select_query_indices(
+                            embed_logits, tree_indices, voxel_xyz)
 
                     # add content queries
                     queries = []
@@ -2346,10 +2652,19 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                     nn_idx_pc1 = torch.cat(nn_idx_pc1)   # (N_pc1,)
                 if tree_indices.numel() > 1:
                     
-                    # FPS from all tree points
-                    batch_tensor_4 = torch.zeros(embed_logits[tree_indices].size(0), dtype=torch.long).to(embed_logits.device)  # Ensure batch_tensor on same device
-                    topk_indices_4 = fps(embed_logits[tree_indices], batch_tensor_4, ratio=min(self.query_point_num / embed_logits[tree_indices].size(0), torch.tensor([1.0]).to(embed_logits.device)))
-                    selected_indices_case4 = tree_indices[topk_indices_4]
+                    if self.query_selection_mode == 'isa':
+                        # Baseline ISA-FPS from all predicted tree voxels.
+                        batch_tensor_4 = torch.zeros(embed_logits[tree_indices].size(0), dtype=torch.long).to(embed_logits.device)  # Ensure batch_tensor on same device
+                        topk_indices_4 = fps(embed_logits[tree_indices], batch_tensor_4, ratio=min(self.query_point_num / embed_logits[tree_indices].size(0), torch.tensor([1.0]).to(embed_logits.device)))
+                        selected_indices_case4 = tree_indices[topk_indices_4]
+                    else:
+                        voxel_xyz = scatter_mean(
+                            pc3[:, :3],
+                            inverse_mapping2,
+                            dim=0,
+                            dim_size=embed_logits.size(0))
+                        selected_indices_case4 = self._select_query_indices(
+                            embed_logits, tree_indices, voxel_xyz)
 
                     # add content queries
                     queries = []
